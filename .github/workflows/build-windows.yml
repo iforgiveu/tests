@@ -1,0 +1,53 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  windows-core:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      VITE_EDITION: core
+      VITE_APP_PLATFORM: windows
+      EPUB_READER_EXPECTED_EDITION: core
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test
+        run: pnpm test
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Windows EXE
+        shell: pwsh
+        run: |
+          .\scripts\build-windows.ps1 -Edition Core
+
+      - name: Upload windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-core-artifacts
+          path: |
+            src-tauri\target-core\release\bundle\**\*.exe
+            src-tauri\target-core\release\*.exe
+          if-no-files-found: warn
