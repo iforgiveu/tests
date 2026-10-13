@@ -343,58 +343,64 @@ export async function sanitizeChapter(
       }
     }
 
-    // 2) 清理属性
-    for (const attr of Array.from(el.attributes)) {
-      const name = attr.name.toLowerCase();
-      if (name.startsWith("on")) {
-        el.removeAttribute(attr.name);
-        continue;
-      }
-      if (name === "src" || name === "poster" || name === "data" || name === "xlink:href" || (opts.archiveReferences && name === "href" && (tag === "image" || tag === "use"))) {
-        const value = attr.value.trim();
-        if (!value) continue;
-        if (/^\s*javascript:/i.test(value)) {
-          el.removeAttribute(attr.name);
-          continue;
-        }
-        // fragment-only or protocol-relative keep as-is / skip rewriting
-        if (isFragmentOnly(value) || value.startsWith("//")) {
-          continue;
-        }
-        // External http(s) URLs: attempt best-effort fetch and convert to blob URL
-        if (isExternalUrl(value)) {
-          try {
-            // best-effort: fetch and create blob URL so reader can display without cross-origin issues
-            const resp = await fetch(value);
-            if (resp.ok) {
-              const buf = await resp.arrayBuffer();
-              const contentType = resp.headers.get("content-type") ?? "application/octet-stream";
-              const blob = new Blob([buf], { type: contentType });
-              const externalBlobUrl = URL.createObjectURL(blob);
-              el.setAttribute(attr.name, externalBlobUrl);
-            } else {
-              // If fetch failed, leave original absolute URL (CSP allows https/http in img-src)
-              // or alternatively remove attribute for stricter behavior. We keep original.
-            }
-          } catch (e) {
-            // ignore network errors; keep original value
-          }
-          continue;
-        }
-        const ref = opts.archiveReferences
-          ? resolveArchiveHref(opts.archiveReferences, opts.basePath, value)
-          : { path: resolvePath(opts.basePath, value), anchor: "" };
-        const url = urlFor(ref.path);
-        if (url) {
-          el.setAttribute(attr.name, url + (ref.anchor ? "#" + encodeURIComponent(ref.anchor) : ""));
-        } else {
-          el.removeAttribute(attr.name);
-        }
-      } else if (name === "href" && el.tagName.toLowerCase() === "a") {
-        const value = attr.value.trim();
-        if (/^\s*javascript:/i.test(value)) el.removeAttribute(attr.name);
-      }
+for (const attr of Array.from(el.attributes)) {
+  const name = attr.name.toLowerCase();
+  if (name.startsWith("on")) {
+    el.removeAttribute(attr.name);
+    continue;
+  }
+  if (
+    name === "src" ||
+    name === "poster" ||
+    name === "data" ||
+    name === "xlink:href" ||
+    (opts.archiveReferences && name === "href" && (tag === "image" || tag === "use"))
+  ) {
+    const value = attr.value.trim();
+    if (!value) continue;
+
+    if (/^\s*javascript:/i.test(value)) {
+      el.removeAttribute(attr.name);
+      continue;
     }
+
+    // 允许 fragment-only / protocol-relative 保持原样
+    if (isFragmentOnly(value) || value.startsWith("//")) {
+      continue;
+    }
+
+    // 外链 http(s) 图片：优先下载并转成 blob URL
+    if (isExternalUrl(value)) {
+      try {
+        const resp = await fetch(value);
+        if (resp.ok) {
+          const buf = await resp.arrayBuffer();
+          const contentType = resp.headers.get("content-type") ?? "application/octet-stream";
+          const blob = new Blob([buf], { type: contentType });
+          const blobUrl = URL.createObjectURL(blob);
+          el.setAttribute(attr.name, blobUrl);
+        }
+      } catch {
+        // 下载失败时安全回退，保留原始外链 URL（CSP 允许 http(s) img-src）
+      }
+      continue;
+    }
+
+    // 书内资源逻辑维持原有行为
+    const ref = opts.archiveReferences
+      ? resolveArchiveHref(opts.archiveReferences, opts.basePath, value)
+      : { path: resolvePath(opts.basePath, value), anchor: "" };
+    const url = urlFor(ref.path);
+    if (url) {
+      el.setAttribute(attr.name, url + (ref.anchor ? "#" + encodeURIComponent(ref.anchor) : ""));
+    } else {
+      el.removeAttribute(attr.name);
+    }
+  } else if (name === "href" && el.tagName.toLowerCase() === "a") {
+    const value = attr.value.trim();
+    if (/^\s*javascript:/i.test(value)) el.removeAttribute(attr.name);
+  }
+}
 
     // 3) 内联 style 中的 url()
     const style = el.getAttribute("style");
