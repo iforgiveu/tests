@@ -21,16 +21,14 @@ export interface SanitizeOptions {
   getText?: (path: string) => string | undefined;
   /** 由改写后的内容生成 URL（浏览器传 blob，测试传假实现） */
   makeUrl?: (text: string, mediaType: string) => string;
-  /** Optional per-book cache. The caller owns/releases the returned shared lease. */
-  stylesheetFor?: (path: string) => { url: string; unresolvedResources: readonly string[] } | undefined;
   settings: ReaderSettings;
 }
 
 export interface SanitizeResult {
   html: string;
   issues: string[];
-  /** 本章没有可用 URL 的书内资源路径（已去重），不等同读取失败；
-   * ResourceServer按本书实际请求状态区分缺失、按需未加载和失败。 */
+  /** 本章没有可用 URL 的书内资源路径（已去重）。路径即故障身份，由界面按
+   * 书会话聚合，并区分“书中不存在”与“存在但读取失败”。 */
   unresolvedResources: string[];
   /** 是否发生了解析降级（XML 失败转 HTML） */
   downgraded: boolean;
@@ -86,9 +84,10 @@ export function isSafeColor(v: string): boolean {
   return SAFE_NAMES.has(v.trim().toLowerCase());
 }
 
-const DEFAULT_FONT_FAMILY = `"Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC", sans-serif`;
-
 function buildOverrideCss(s: ReaderSettings): string {
+  const family =
+    s.fontFamily ??
+    `"Segoe UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC", sans-serif`;
   const maxEm = TEXT_MEASURE.maxEm;
 
   // ---- L1 安全/阅读器底线：脚注 aside 必须从正文流隐藏 ----
@@ -228,7 +227,7 @@ function buildOverrideCss(s: ReaderSettings): string {
   border: 0;
 }`;
 
-  // ---- L2 用户设置：字号和用户明确选择的字体。默认字体在独立低优先级层。 ----
+  // ---- L2 用户设置：字号/主题/字体 fallback（书 body 字体声明优先） ----
   const escapeFamily = escapeCssString;
   const fontFaceCss = (s.fontSource === "system" ? [] : (s.customFonts ?? []))
     .map(
@@ -261,7 +260,8 @@ html, body, #${VIEWER_ID},
 }`
     : "";
   const typographyCss = [
-    `html { font-size: ${s.fontSizePx}px !important;${s.fontFamily ? ` font-family: ${s.fontFamily};` : ""} }`,
+    `/* [L2] 字体 fallback 只放 html；书在 body 上的内嵌字体声明优先。 */`,
+    `html { font-size: ${s.fontSizePx}px !important; font-family: ${family}; }`,
     fontFaceCss,
     bodyFontCss ? `body { ${bodyFontCss} }` : "",
     descendantFontCss,
@@ -295,6 +295,44 @@ ${VIEWER_TAG}#${VIEWER_ID} { display: block; height: 100%; overflow: hidden; mar
   ].join("\n");
 }
 
+// ---------
+const ESCAPED_TAG_RE =
+  /<(?:img|br|hr|p|div|span|a|em|strong|b|i|u)\b[^<>]*>/i;
+
+function hydrateEscapedTags(doc: Document): void {
+  const body = doc.getElementsByTagName("body")[0] ?? doc.documentElement;
+  if (!body) return;
+
+  const walker = doc.createTreeWalker(body, 4 /* SHOW_TEXT */);
+  const targets: Text[] = [];
+  while (walker.nextNode()) {
+    const t = walker.currentNode.textContent ?? "";
+    if (ESCAPED_TAG_RE.test(t)) targets.push(walker.currentNode as Text);
+  }
+
+  for (const node of targets) {
+    const text = node.textContent ?? "";
+    // 标签之外还有大段正文 → 不是"被整段转义的标签"，跳过防误伤
+    if (text.replace(ESCAPED_TAG_RE, "").trim().length > 20) continue;
+    if (typeof DOMParser === "undefined") continue; // 非 DOM 测试环境
+
+    const parsed = new DOMParser().parseFromString(
+      text.replace(/&lt;/g, "<").replace(/&gt;/g, ">"),
+      "text/html"
+    );
+    const parent = node.parentNode;
+    if (!parent) continue;
+    // 逐个把解析出的真实元素插回原文本节点位置
+    let anchor: Node = node;
+    for (const child of Array.from(parsed.body.childNodes)) {
+      parent.insertBefore(child, anchor.nextSibling);
+      anchor = anchor.nextSibling!;
+    }
+    parent.removeChild(node);
+  }
+}
+// -----------
+
 /**
  * 消毒并改写章节 HTML：
  * 1. 按版本选择 XML/HTML 解析（XML 失败自动降级 HTML）
@@ -320,6 +358,9 @@ export async function sanitizeChapter(
   if (!root) {
     throw new Error("章节内容为空，无法渲染");
   }
+// 0) 还原文本节点中被转义的标签（如 &lt;img src="https://..."&gt;） ，
+//    让它们成为真实元素，才能被下面的属性消毒/外链下载循环处理。
+hydrateEscapedTags(doc);
 
   // 1) 移除危险标签
   for (const el of Array.from(doc.getElementsByTagName("*"))) {
@@ -367,6 +408,31 @@ export async function sanitizeChapter(
         if (isFragmentOnly(value) || isExternalUrl(value) || value.startsWith("//")) {
           continue;
         }
+    // 外链 http(s) 图片：优先下载并转成 blob URL
+	// 直连可用，恒等函数即可；将来某环境直连受限时，只改这一个函数
+
+
+if (isExternalUrl(value)) {
+  const absolute = value.startsWith("//") ? `https:${value}` : value;
+  // 只对 http/https 做下载；mailto/tel/data/blob/file 不下载
+  if (/^https?:/i.test(absolute)) {
+    // try {
+      // const resp = await fetch(toProxyUrl(absolute));   // ← 走你的代理
+      // if (resp.ok) {
+        // const buf = await resp.arrayBuffer();
+        // const contentType = resp.headers.get("content-type") ?? "application/octet-stream";
+        // const blob = new Blob([buf], { type: contentType });
+        // el.setAttribute(attr.name, URL.createObjectURL(blob));
+      // }
+    // } catch {
+      // 回退：保留原始（或补全后的）URL
+      if (value.startsWith("//")) el.setAttribute(attr.name, absolute);
+    // }
+  }
+  continue;
+}
+
+    // 书内资源逻辑维持原有行为
         const ref = opts.archiveReferences
           ? resolveArchiveHref(opts.archiveReferences, opts.basePath, value)
           : { path: resolvePath(opts.basePath, value), anchor: "" };
@@ -396,12 +462,6 @@ export async function sanitizeChapter(
       const href = link.getAttribute("href");
       if (href && !isExternalUrl(href)) {
         const cssPath = opts.archiveReferences ? resolveArchiveHref(opts.archiveReferences, opts.basePath, href).path : resolvePath(opts.basePath, href);
-        const shared = opts.stylesheetFor?.(cssPath);
-        if (shared) {
-          link.setAttribute("href", shared.url);
-          for (const path of shared.unresolvedResources) missingResources.add(path);
-          continue;
-        }
         // 优先：读取 CSS 内容并改写其内部引用（@font-face/background/@import 相对路径）
         const cssText = opts.getText?.(cssPath);
         if (cssText !== undefined && opts.makeUrl) {
@@ -710,20 +770,6 @@ ${VIEWER_TAG}#${VIEWER_ID}::-webkit-scrollbar {
 }`;
     head.appendChild(scrollStyle);
   }
-
-  // Establish this normal-priority layer before any author CSS layers. Both
-  // author html and body declarations must beat the reader's default font.
-  // Keep it separate from explicit font overrides and the user CSS below.
-  const fontFallback = doc.createElement("style");
-  fontFallback.setAttribute("data-reader", "font-fallback");
-  fontFallback.textContent = `@layer epub-reader-font-fallback { :where(html) { font-family: ${DEFAULT_FONT_FAMILY}; } }`;
-  // XML documents (including the Node parser) do not expose HTMLDocument.head.
-  const fontHead = doc.getElementsByTagName("head")[0] ?? head;
-  const firstStylesheet = Array.from(fontHead.childNodes)
-    .filter((node): node is Element => node.nodeType === 1).find(el =>
-      el.localName === "style" || (el.localName === "link" && /\bstylesheet\b/iu.test(el.getAttribute("rel") ?? ""))
-    ) ?? null;
-  fontHead.insertBefore(fontFallback, firstStylesheet);
 
   const styleEl = doc.createElement("style");
   styleEl.setAttribute("data-reader", "overrides");
