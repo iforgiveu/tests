@@ -27,7 +27,7 @@ import { isExternalUrl, isFragmentOnly, splitHref } from "./core/paths";
 import type { SearchResult } from "./core/search";
 import type { ExactTextHit } from "./core/exactTextHits";
 import type { SearchOccurrence } from "./core/searchOccurrence";
-import { ResourceServer, type ResourceIssue } from "./render/resources";
+import { ResourceServer } from "./render/resources";
 import { sanitizePersistedTextAnchor } from "./render/textAnchor";
 import { clearDocumentSelection, isSelectAllShortcut } from "./render/selectionGuard";
 import { arrowKeyDirection, effectivePageProgression, normalizeTurnAnimation } from "./render/settings";
@@ -595,9 +595,6 @@ const BOOKMARK_JUMP_GUARD_AFTER_LANDING_MS = 1300;
 /** 跳转迟迟不落定（失败、被别的导航取代）时，保护最多持续这么久。 */
 const BOOKMARK_JUMP_GUARD_MAX_MS = 8000;
 const PANEL_WARM_IDLE_BATCHES_MOBILE: readonly PanelWarmBatch[] = [["more"], ...PANEL_WARM_IDLE_BATCHES];
-const EMPTY_RESOURCE_ISSUES: readonly ResourceIssue[] = [];
-const getNoResourceIssues = () => EMPTY_RESOURCE_ISSUES;
-const subscribeNoResourceIssues = () => () => {};
 
 export default function App() {
   const { t } = useUiText();
@@ -608,11 +605,6 @@ export default function App() {
   const [phase, setPhase] = useState<AppPhase>({ phase: "idle" });
   const [book, setBook] = useState<Book | null>(null);
   const [server, setServer] = useState<ResourceServer | null>(null);
-  const resourceIssues = useSyncExternalStore(
-    server?.subscribeResourceIssues ?? subscribeNoResourceIssues,
-    server?.getResourceIssues ?? getNoResourceIssues,
-    getNoResourceIssues,
-  );
   const [bookKey, setBookKey] = useState("");
   const [spineIndex, setSpineIndex] = useState(0);
   const [anchor, setAnchor] = useState<string | undefined>(undefined);
@@ -638,6 +630,8 @@ export default function App() {
   } = useReaderSession(() => activeSessionRef.current?.generation);
   const { settings, setSettings, uiScale, settingsActions } = useReaderSettings();
   const [runtimeIssues, setRuntimeIssues] = useState<string[]>([]);
+  /** B-225: category + book path already logged in this book session. */
+  const reportedResourcesRef = useRef(new Set<string>());
   const [diagText, setDiagText] = useState<string | null>(null);
   const [initialAnchor, setInitialAnchor] = useState<PersistedReaderAnchor | null>(null);
   const [initialPage, setInitialPage] = useState<number | null>(0);
@@ -1263,6 +1257,7 @@ export default function App() {
       setServer(srv);
       setBookKey(key);
       setRuntimeIssues([]);
+      reportedResourcesRef.current = new Set();
       setChapterState({ status: "loading" });
       setSpineIndex(start);
       setAnchor(undefined);
@@ -3003,18 +2998,20 @@ export default function App() {
     [closeForeground, closeImageOverlay]
   );
 
-  const handleIssues = useCallback((issues: string[]) => {
-    // ResourceServer owns per-path status; raw unresolved URLs also include deferred fonts.
-    if (issues.length > 0) setRuntimeIssues((prev) => [...prev, ...issues]);
-  }, []);
-
-  const refreshLogDiagnostics = useCallback(() => {
-    const readerDiagnosis = readerRef.current?.diagnose() ?? uiText("log.diagnostics.unavailable");
-    const lifecycleDiagnosis = lifecycleDiagnosticsRef.current.length > 0
-      ? ["", "--- 匿名生命周期诊断 ---", ...lifecycleDiagnosticsRef.current].join("\n")
-      : "\n--- 匿名生命周期诊断 ---\n（尚无记录）";
-    const capturedAt = uiText("log.diagnostics.capturedAt", { time: new Date().toLocaleString() });
-    setDiagText(`${capturedAt}\n${readerDiagnosis}${lifecycleDiagnosis}`);
+  const handleIssues = useCallback((issues: string[], unresolvedResources: readonly string[] = []) => {
+    // Every chapter that shares a stylesheet re-reports the same reference:
+    // log each book file once per session, and say whether the book lacks it
+    // (an authored reference/fallback) or it exists but could not be read.
+    const resources = bookRef.current?.resources;
+    const next = [...issues];
+    for (const path of unresolvedResources) {
+      const absent = resources?.has(path) === false;
+      const identity = `${absent ? "absent" : "unavailable"}:${path}`;
+      if (reportedResourcesRef.current.has(identity)) continue;
+      reportedResourcesRef.current.add(identity);
+      next.push(uiText(absent ? "appUi.issue.resourceAbsent" : "appUi.issue.resourceUnavailable", { path }));
+    }
+    if (next.length > 0) setRuntimeIssues((prev) => [...prev, ...next]);
   }, []);
 
   const handleToggleLog = useCallback(() => {
@@ -3030,10 +3027,14 @@ export default function App() {
       } else if (current.kind === "transient" && current.transient === "selection") {
         readerRef.current?.clearTextSelection();
       }
-      refreshLogDiagnostics();
+      const readerDiagnosis = readerRef.current?.diagnose() ?? "（阅读器未初始化）";
+      const lifecycleDiagnosis = lifecycleDiagnosticsRef.current.length > 0
+        ? ["", "--- 匿名生命周期诊断 ---", ...lifecycleDiagnosticsRef.current].join("\n")
+        : "\n--- 匿名生命周期诊断 ---\n（尚无记录）";
+      setDiagText(readerDiagnosis + lifecycleDiagnosis);
       return openReaderPanel(current, "log");
     });
-  }, [refreshLogDiagnostics]);
+  }, []);
 
   const handleFootnoteClose = useCallback(() => {
     setForeground((current) =>
@@ -3836,7 +3837,7 @@ export default function App() {
     } else {
       handleFootnoteClose(); // 文档被替换（字号变化等）：关闭弹层
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- Reposition on layout changes; storing the new footnote rect must not trigger this effect again.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chapterState, uiScale, handleFootnoteClose]);
 
   useEffect(() => {
@@ -4749,14 +4750,6 @@ export default function App() {
   const logItems: LogItem[] = [
     ...(book?.issues ?? []).map((i) => ({ kind: i.kind, source: i.source, message: i.message })),
     ...runtimeIssues.map((m) => ({ kind: "reader_error", source: "render", message: m })),
-    ...resourceIssues.map((issue) => ({
-      kind: "reader_error",
-      source: "render",
-      resolved: issue.recovered,
-      message: uiText(issue.recovered ? "appUi.issue.resourceRecovered"
-        : issue.kind === "missing" ? "appUi.issue.resourceAbsent" : "appUi.issue.resourceUnavailable", { path: issue.path })
-        + (issue.error ? `\n${uiText("log.resourceErrorRecord", { error: issue.error })}` : ""),
-    })),
   ];
 
   // ---- 全屏 / 沉浸禅模式（Zen Mode） ----
@@ -4867,6 +4860,8 @@ export default function App() {
           const isModifier = e.ctrlKey || e.metaKey || e.altKey;
           const isSpecial =
             e.key === "F11" ||
+			e.key === "z" ||
+            e.key === "Z" ||
             e.key === "Escape" ||
             e.key === "[" ||
             e.key === "]";
@@ -5063,7 +5058,7 @@ export default function App() {
       }
 
       // 5. F11：进入/退出全屏（纯净沉浸模式）
-      if (e.key === "F11") {
+      if (e.key === "F11"||e.key === "z" || e.key === "Z") {
         e.preventDefault();
         if (e.repeat) return;
         void toggleFullscreen();
@@ -5487,8 +5482,6 @@ export default function App() {
                 preloadNextChapter={settings.preloadNextChapter === true}
                 preloadNextChapterDisabled={book?.fixedLayout === true}
                 onPreloadNextChapterChange={settingsActions.setPreloadNextChapter}
-                seamlessChapterTurn={settings.seamlessChapterTurn === true}
-                onSeamlessChapterTurnChange={settingsActions.setSeamlessChapterTurn}
                 customCss={settings.customCss}
                 onCustomCssChange={settingsActions.setCustomCss}
                 onResetDefaults={resetDefaults}
@@ -5675,9 +5668,7 @@ export default function App() {
                       readerRef.current?.clearTextSelection();
                     }}
                     onAddNote={() => {
-                      // 双页拼接屏上选的可能是另一章的半页：笔记按选中文字所在的章记。
-                      const selectedIndex = book ? spineIndexForEntryKey(book, selectionContext.chapterPath) : -1;
-                      openComposer({ mode: "create", selection: selectionContext, spineIndex: selectedIndex >= 0 ? selectedIndex : spineIndex });
+                       openComposer({ mode: "create", selection: selectionContext, spineIndex });
                       readerRef.current?.clearTextSelection();
                     }}
                     onClose={() => {
@@ -5873,7 +5864,6 @@ export default function App() {
         <LogPanel
           items={logItems}
           diagText={diagText}
-          onRefresh={refreshLogDiagnostics}
           onClose={() => {
             closePanel("log");
             setDiagText(null);
